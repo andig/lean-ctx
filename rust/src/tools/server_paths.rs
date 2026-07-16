@@ -92,76 +92,74 @@ impl LeanCtxServer {
             Err(e) => {
                 // #899: the rejected path is dependency source in a language
                 // cache (Go module cache, cargo registry, site-packages,
-                // node_modules, …). Register its root as a session-scoped
-                // read-only root and ask the agent to retry — the next resolve
-                // sees it in the read allow-list. Stays fail-closed: this first
-                // call still errors, and writes into the cache remain denied.
-                if let Some((label, cache_root)) =
-                    crate::core::pathjail::detect_language_cache_root(&resolved)
-                    && crate::core::pathjail::register_session_read_only_root(&cache_root)
-                {
-                    return Err(format!(
-                        "Auto-detected {label} at {} — added as a read-only root for this \
-                         session. Retry the read.",
-                        cache_root.display()
-                    ));
-                }
-                if p.is_absolute() {
-                    if let Some(new_root) = maybe_derive_project_root_from_absolute(&resolved) {
-                        let cfg_allow = std::env::var("LEAN_CTX_ALLOW_REROOT").map_or_else(
-                            |_| crate::core::config::Config::load().allow_auto_reroot,
-                            |v| v == "1" || v == "true",
-                        );
-                        let candidate_under_jail = resolved.starts_with(jail_root_path);
-                        // #580/#649: when the MCP server was launched from an
-                        // agent/IDE config dir (e.g. ~/.copilot) or a markerless
-                        // client cwd (e.g. WSL VS Code starting in /mnt/c/Users),
-                        // that jail is not a real project boundary. The derived
-                        // root already carries a project marker, so correcting to
-                        // it is a root fix, not a jail weakening. Real project
-                        // roots and trusted startup roots still keep the
-                        // conservative gate.
-                        let allow_reroot = if candidate_under_jail {
-                            false
-                        } else if is_suspicious_root(jail_root_path)
-                            || (self.startup_project_root.is_none()
-                                && !has_project_marker(jail_root_path))
-                        {
-                            true
-                        } else if !cfg_allow {
-                            false
-                        } else if let Some(ref trusted_root) = self.startup_project_root {
-                            std::path::Path::new(trusted_root) == new_root.as_path()
-                        } else {
-                            !has_project_marker(jail_root_path)
-                        };
+                // node_modules, …), so auto-allow it read-only for this session.
+                // Go/Rust pass straight through on this very call (the toolchain
+                // names the canonical root); the rest fail closed once and
+                // resolve on the agent's retry. Writes stay denied either way.
+                use crate::core::language_cache::CacheAccess;
+                match crate::core::language_cache::language_cache_access(
+                    &resolved,
+                    jail_root_path,
+                    &extra_roots,
+                ) {
+                    Some(CacheAccess::PassThrough(jailed)) => jailed,
+                    Some(CacheAccess::Retry(hint)) => return Err(hint),
+                    None if p.is_absolute() => {
+                        if let Some(new_root) = maybe_derive_project_root_from_absolute(&resolved) {
+                            let cfg_allow = std::env::var("LEAN_CTX_ALLOW_REROOT").map_or_else(
+                                |_| crate::core::config::Config::load().allow_auto_reroot,
+                                |v| v == "1" || v == "true",
+                            );
+                            let candidate_under_jail = resolved.starts_with(jail_root_path);
+                            // #580/#649: when the MCP server was launched from an
+                            // agent/IDE config dir (e.g. ~/.copilot) or a markerless
+                            // client cwd (e.g. WSL VS Code starting in /mnt/c/Users),
+                            // that jail is not a real project boundary. The derived
+                            // root already carries a project marker, so correcting to
+                            // it is a root fix, not a jail weakening. Real project
+                            // roots and trusted startup roots still keep the
+                            // conservative gate.
+                            let allow_reroot = if candidate_under_jail {
+                                false
+                            } else if is_suspicious_root(jail_root_path)
+                                || (self.startup_project_root.is_none()
+                                    && !has_project_marker(jail_root_path))
+                            {
+                                true
+                            } else if !cfg_allow {
+                                false
+                            } else if let Some(ref trusted_root) = self.startup_project_root {
+                                std::path::Path::new(trusted_root) == new_root.as_path()
+                            } else {
+                                !has_project_marker(jail_root_path)
+                            };
 
-                        if allow_reroot {
-                            let mut session = self.session.write().await;
-                            let new_root_str = new_root.to_string_lossy().to_string();
-                            session.project_root = Some(new_root_str.clone());
-                            session.shell_cwd = self
-                                .startup_shell_cwd
-                                .as_ref()
-                                .filter(|cwd| std::path::Path::new(cwd).starts_with(&new_root))
-                                .cloned()
-                                .or_else(|| Some(new_root_str.clone()));
-                            let _ = session.save();
+                            if allow_reroot {
+                                let mut session = self.session.write().await;
+                                let new_root_str = new_root.to_string_lossy().to_string();
+                                session.project_root = Some(new_root_str.clone());
+                                session.shell_cwd = self
+                                    .startup_shell_cwd
+                                    .as_ref()
+                                    .filter(|cwd| std::path::Path::new(cwd).starts_with(&new_root))
+                                    .cloned()
+                                    .or_else(|| Some(new_root_str.clone()));
+                                let _ = session.save();
 
-                            crate::core::pathjail::jail_path_with_roots(
-                                &resolved,
-                                &new_root,
-                                &extra_roots,
-                            )
-                            .map_err(|e| e.to_string())?
+                                crate::core::pathjail::jail_path_with_roots(
+                                    &resolved,
+                                    &new_root,
+                                    &extra_roots,
+                                )
+                                .map_err(|e| e.to_string())?
+                            } else {
+                                return Err(e.to_string());
+                            }
                         } else {
                             return Err(e.to_string());
                         }
-                    } else {
-                        return Err(e.to_string());
                     }
-                } else {
-                    return Err(e.to_string());
+                    None => return Err(e.to_string()),
                 }
             }
         };

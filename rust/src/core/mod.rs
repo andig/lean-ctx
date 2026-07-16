@@ -541,6 +541,7 @@ pub mod deep_queries;
 pub mod deps;
 pub mod editor_registry;
 pub mod firewall;
+pub mod language_cache;
 pub mod pathjail;
 pub mod signatures;
 #[cfg(feature = "tree-sitter")]

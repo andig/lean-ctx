@@ -190,18 +190,64 @@ mod resolve_path_tests {
     #[cfg(not(feature = "no-jail"))]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn resolve_path_auto_registers_language_cache_then_retry_succeeds() {
-        // #899: reading dependency source in a language cache (here a Go module
-        // cache outside the project) fails closed once with an auto-detect hint,
-        // then resolves on retry — no config edit, no subprocess.
+    async fn resolve_path_passes_through_go_module_cache_on_first_call() {
+        // #899 option B: reading dependency source in the Go module cache
+        // resolves on the *first* call — `go env GOMODCACHE` (here the env var
+        // that overrides it) names the root, so there is no retry round-trip and
+        // no config edit.
         let _iso = crate::core::data_dir::isolated_data_dir();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");
         create_git_root(&root);
-        let dep = tmp.path().join("go/pkg/mod/example.com/lib@v1");
+        let cache = tmp.path().join("gohome/go/pkg/mod");
+        let dep = cache.join("example.com/lib@v1");
         std::fs::create_dir_all(&dep).unwrap();
         let file = dep.join("lib.go");
         std::fs::write(&file, "package lib").unwrap();
+
+        let server = LeanCtxServer::new_with_startup(
+            None,
+            Some(root.as_path()),
+            SessionMode::Personal,
+            "default",
+            "default",
+        );
+        {
+            let mut session = server.session.write().await;
+            session.project_root = Some(root.to_string_lossy().to_string());
+            session.shell_cwd = Some(root.to_string_lossy().to_string());
+        }
+
+        crate::test_env::set_var("GOMODCACHE", &cache);
+        let out = server.resolve_path(&file.to_string_lossy()).await;
+        crate::test_env::remove_var("GOMODCACHE");
+
+        let out = out.unwrap_or_else(|e| panic!("first read must pass through, got: {e}"));
+        assert!(out.ends_with("/lib.go"), "cache file resolves: {out}");
+        // Read-only: the same path is not writable.
+        assert!(
+            crate::core::pathjail::enforce_writable(&file).is_err(),
+            "the auto-allowed cache root must stay read-only"
+        );
+    }
+
+    #[cfg(not(feature = "no-jail"))]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn resolve_path_auto_registers_language_cache_then_retry_succeeds() {
+        // #899 option A: a language cache with no deterministic root (here a
+        // venv's site-packages) fails closed once with an auto-detect hint, then
+        // resolves on retry — no config edit.
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        create_git_root(&root);
+        let dep = tmp
+            .path()
+            .join("venv/lib/python3.12/site-packages/requests");
+        std::fs::create_dir_all(&dep).unwrap();
+        let file = dep.join("api.py");
+        std::fs::write(&file, "def get(): ...").unwrap();
 
         let server = LeanCtxServer::new_with_startup(
             None,
@@ -222,7 +268,7 @@ mod resolve_path_tests {
             .await
             .unwrap_err();
         assert!(
-            err.contains("Auto-detected Go module cache"),
+            err.contains("Auto-detected Python site-packages"),
             "expected auto-detect hint, got: {err}"
         );
         assert!(err.contains("Retry"), "hint must ask for a retry: {err}");
@@ -232,7 +278,10 @@ mod resolve_path_tests {
             .resolve_path(&file.to_string_lossy())
             .await
             .unwrap_or_else(|e| panic!("retry must resolve, got: {e}"));
-        assert!(ok.ends_with("/lib.go"), "retry resolves the cache file: {ok}");
+        assert!(
+            ok.ends_with("/api.py"),
+            "retry resolves the cache file: {ok}"
+        );
     }
 
     #[cfg(not(feature = "no-jail"))]
