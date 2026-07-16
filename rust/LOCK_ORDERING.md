@@ -74,6 +74,7 @@ All `std::sync::Mutex` unless noted otherwise.
 | L61 | `CLI_OVERLAY` | `core/index_filter.rs:31` | `RwLock<Option<CliOverlay>>` | Per-run index corpus filter overlay (#735): written once by the `index` CLI dispatch before builders start, read by every index walk via `IndexFileFilter::resolve`; independent leaf lock, never nested |
 | L62 | `TARGETS` | `core/eviction_orchestrator.rs:48` | `LazyLock<Mutex<EvictionRegistry>>` | Process-wide registry of live `EvictionOrchestrator` weak refs (RAM guardian, multi-session): `register()`/`on_memory_pressure()` lock it only to clone/upgrade the target list, then drop it before calling `on_pressure()` on each target — never held while a per-target `controller` lock (or any other lock) is acquired; independent leaf lock, never nested |
 | L62 | `BLOCK` | `core/events.rs:289` | `OnceLock<Mutex<LocalBlock>>` (fn-local static) | Per-process cache of the current pre-reserved event-id block (`next`/`last`) inside `next_event_id()`: most calls just bump `next` under the lock; on exhaustion the lock is held across the refill call to `reserve_event_id_block_at`, which takes its own independent OS file lock (`events.seq.lock`, not a Rust static) to persist the next block — never nested with another *static* Rust lock |
+| L63 | `SESSION_READ_ONLY_ROOTS` | `core/pathjail.rs:143` | `OnceLock<Mutex<Vec<PathBuf>>>` | Session-scoped read-only roots auto-registered from language caches (#899, Go module cache / cargo registry / site-packages / …). `register_session_read_only_root` locks it only to dedup-and-push, and `session_read_only_roots` only to clone; the guard is dropped before the jail re-runs. `read_only_roots_from_env_and_config` calls `Config::load` (L4) *before* it clones this, and L4 is released inside `load`, so the two are never held together; independent leaf lock, never nested |
 
 ### Test / Environment Locks (serialise env-var mutations)
 
@@ -205,9 +206,9 @@ Override via `LEAN_CTX_WORKER_THREADS` (positive integer) for environments with 
 concurrent subagents. Example: `LEAN_CTX_WORKER_THREADS=8`. The blocking thread pool
 is always `worker_threads * 4`, clamped to `[8, 32]`.
 
-### Independent Static Locks (L3–L61)
+### Independent Static Locks (L3–L63)
 
-All other static locks (L3–L61) — **except the L22 → L4 pair documented above** — are
+All other static locks (L3–L63) — **except the L22 → L4 pair documented above** — are
 **independent singletons**: they protect isolated subsystem state and are never nested inside
 each other. Each should be acquired in isolation:
 
